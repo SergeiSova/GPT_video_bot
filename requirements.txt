@@ -1,0 +1,3 @@
+python-telegram-bot==20.8
+moviepy==1.0.3
+numpy==1.26.4
