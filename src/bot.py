@@ -35,6 +35,7 @@ class DurationOption:
 
 
 MAX_DURATION_SECONDS: Final[int] = 60
+MAX_PARALLEL_RENDERS: Final[int] = int(os.getenv("MAX_PARALLEL_RENDERS", "1"))
 
 DURATION_OPTIONS: Final[tuple[DurationOption, ...]] = (
     DurationOption(label="15 секунд", seconds=15),
@@ -72,6 +73,12 @@ async def handle_duration_choice(update: Update, context: ContextTypes.DEFAULT_T
         LOGGER.warning("Duration callback triggered without a query object")
         return
 
+    active_users = context.application.bot_data.setdefault("active_users", set())
+    user_id = query.from_user.id
+    if user_id in active_users:
+        await query.answer("Ваше видео уже создаётся. Дождитесь результата.", show_alert=True)
+        return
+
     await query.answer()
 
     try:
@@ -86,26 +93,37 @@ async def handle_duration_choice(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    await query.edit_message_text(
-        f"Генерирую видео длительностью {duration_seconds} секунд. Это может занять до минуты..."
+    semaphore = context.application.bot_data.setdefault(
+        "render_semaphore", asyncio.Semaphore(MAX_PARALLEL_RENDERS)
     )
-
-    if query.message is not None:
-        await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_VIDEO)
-
-    video_path = await asyncio.to_thread(generate_abstract_video, duration_seconds)
-
+    active_users.add(user_id)
+    video_path = None
     try:
+        await query.edit_message_text(
+            f"Генерирую видео длительностью {duration_seconds} секунд. Это может занять до минуты..."
+        )
+
+        if query.message is not None:
+            await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+        async with semaphore:
+            video_path = await asyncio.to_thread(generate_abstract_video, duration_seconds)
+
         with open(video_path, "rb") as video_file:
             await query.message.reply_video(
                 video=video_file,
                 caption=f"Готово! Вот твоё видео на {duration_seconds} секунд.",
             )
+    except Exception:
+        LOGGER.exception("Failed to generate or send video")
+        await query.edit_message_text("Не удалось создать видео. Попробуй ещё раз командой /start.")
     finally:
-        try:
-            os.remove(video_path)
-        except OSError:
-            LOGGER.exception("Failed to remove temporary video file %s", video_path)
+        active_users.discard(user_id)
+        if video_path is not None:
+            try:
+                os.remove(video_path)
+            except OSError:
+                LOGGER.exception("Failed to remove temporary video file %s", video_path)
 
 
 def generate_abstract_video(
@@ -121,12 +139,11 @@ def generate_abstract_video(
         raise ValueError(f"Duration must not exceed {MAX_DURATION_SECONDS} seconds")
 
     width, height = size
+    x = np.linspace(0, np.pi * 2, width)
+    y = np.linspace(0, np.pi * 2, height)
+    xv, yv = np.meshgrid(x, y)
 
     def make_frame(t: float) -> np.ndarray:
-        x = np.linspace(0, np.pi * 2, width)
-        y = np.linspace(0, np.pi * 2, height)
-        xv, yv = np.meshgrid(x, y)
-
         # Create a smooth, looping color pattern based on sine waves.
         phase_shift = t * 2
         r = (np.sin(xv * 2 + phase_shift) + 1) / 2
@@ -142,7 +159,14 @@ def generate_abstract_video(
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     temp_file.close()
 
-    clip.write_videofile(temp_file.name, codec="libx264", audio=False, fps=fps, verbose=False, logger=None)
+    try:
+        clip.write_videofile(temp_file.name, codec="libx264", audio=False, fps=fps, verbose=False, logger=None)
+    except Exception:
+        if os.path.exists(temp_file.name):
+            os.remove(temp_file.name)
+        raise
+    finally:
+        clip.close()
 
     return temp_file.name
 
